@@ -1,0 +1,53 @@
+{
+    "actorSpecification": 1,
+    "fields": {},
+    "views": {
+        "overview": {
+            "title": "Overview",
+            "transformation": {
+                "fields": [
+                    "product_id",
+                    "name",
+                    "price",
+                    "currency",
+                    "image_url",
+                    "product_url",
+                    "availability"
+                ]
+            },
+            "display": {
+                "component": "table",
+                "properties": {
+                    "product_id": {
+                        "label": "Product ID",
+                        "format": "text"
+                    },
+                    "name": {
+                        "label": "Name",
+                        "format": "text"
+                    },
+                    "price": {
+                        "label": "Price",
+                        "format": "text"
+                    },
+                    "currency": {
+                        "label": "Currency",
+                        "format": "text"
+                    },
+                    "image_url": {
+                        "label": "Image",
+                        "format": "image"
+                    },
+                    "product_url": {
+                        "label": "URL",
+                        "format": "link"
+                    },
+                    "availability": {
+                        "label": "Availability",
+                        "format": "text"
+                    }
+                }
+            }
+        }
+    }
+}
