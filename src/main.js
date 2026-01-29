@@ -124,6 +124,9 @@ const crawler = new PlaywrightCrawler({
         });
 
         let extractedProducts = [];
+        // Derive locale fallback from request URL if categoryData failed
+        const requestLocale = new URL(request.url).pathname.split('/').slice(1, 3).join('/');
+        const currentLocale = categoryData?.locale || requestLocale || 'uk/en';
 
         // Step 2: Extract from initial window.zara payload if available
         if (categoryData) {
@@ -139,7 +142,7 @@ const crawler = new PlaywrightCrawler({
 
             if (windowProducts && Array.isArray(windowProducts) && windowProducts.length > 0) {
                 log.info(`Found ${windowProducts.length} products in initial state`);
-                const normalized = normalizeProducts(windowProducts);
+                const normalized = normalizeProducts(windowProducts, currentLocale);
                 extractedProducts.push(...normalized);
             }
         }
@@ -190,7 +193,7 @@ const crawler = new PlaywrightCrawler({
 
             if (apiProducts.products && apiProducts.products.length > 0) {
                 log.info(`Fetched ${apiProducts.products.length} products via API`);
-                const normalizedApi = normalizeProducts(apiProducts.products);
+                const normalizedApi = normalizeProducts(apiProducts.products, currentLocale);
 
                 // Merge with initial products (avoiding duplicates)
                 const productMap = new Map();
@@ -215,7 +218,7 @@ const crawler = new PlaywrightCrawler({
 
             for (const data of jsonLdData) {
                 if (data['@type'] === 'ItemList' && Array.isArray(data.itemListElement)) {
-                    const normalizedLd = normalizeProducts(data.itemListElement);
+                    const normalizedLd = normalizeProducts(data.itemListElement, currentLocale);
                     log.info(`Found ${normalizedLd.length} products in JSON-LD`);
                     extractedProducts.push(...normalizedLd);
                     break;
@@ -258,7 +261,7 @@ await Actor.exit();
 
 // --- HELPERS ---
 
-function normalizeProducts(rawProducts) {
+function normalizeProducts(rawProducts, locale = 'uk/en') {
     if (!Array.isArray(rawProducts)) return [];
 
     return rawProducts.map(item => {
@@ -325,28 +328,15 @@ function normalizeProducts(rawProducts) {
 
             // Construct full URL with -p suffix which is standard for Zara
             if (slug && seoId) {
-                // We'll use a relative path, but we need to ensure it includes the locale if known
-                // Usually normalized URLs are just /{slug}-p{id}.html and the browser handles the locale
-                // But for the scraper output, we want the full link.
-                // We'll trust the base `https://www.zara.com` and add the locale if we can contextually find it, 
-                // otherwise defaults to just root which redirects.
-                // BETTER: Use the format /slug-p{id}.html which Zara resolves, OR try to keep the locale.
-                productUrl = `/${slug}-p${seoId}.html`;
+                // Use locale prefix if available
+                const prefix = locale ? `/${locale}` : '';
+                productUrl = `${prefix}/${slug}-p${seoId}.html`;
             } else if (p.semanticUrl) {
                 productUrl = `/${p.semanticUrl}`;
             }
 
             // Ensure absolute URL
             if (productUrl && !productUrl.startsWith('http')) {
-                // If we have a locale in the item (sometimes passed down) use it, else default
-                // Ideally we should pass the 'locale' into this function or regex it from startUrl
-                // For now, let's prepend https://www.zara.com
-                // Note: The user wants /uk/en/ style. 
-                // We can try to keep the prefix from the scraped data if available, but simplest is root relative.
-                // However, valid zara links are often: https://www.zara.com/uk/en/slug-pID.html
-                // We will rely on the input URL or detected locale in step 1 if we passed it down.
-                // Let's assume the crawler request URL context is handled elsewhere or we output relative path
-                // But to be safe and match the request:
                 productUrl = `https://www.zara.com${productUrl}`;
             }
 
