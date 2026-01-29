@@ -8,3 +8,5 @@ dist
 node_modules
 apify_storage
 storage
+SUMMARY.md
+TECHNICAL.md

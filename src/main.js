@@ -1,4 +1,32 @@
-// Zara Product Scraper - Production-ready with robust extraction
+// Zara Product Scraper - Production-ready with hybrid browser API approach
+//
+// STRATEGY: Multi-layered extraction with fallbacks
+// ==========================================
+// 1. SSR/Hydration Data: Extract from window.__PRELOADED_STATE__ or window.zara
+//    - Fastest method, data is already loaded in page
+//    - Works immediately on page load
+//
+// 2. Internal API Fetching: Use browser context to call Zara's internal APIs
+//    - Fetches JSON directly via page.evaluate(fetch())
+//    - Inherits valid browser session/cookies (bypasses bot detection)
+//    - URL: https://www.zara.com/{locale}/category/{categoryId}/products?ajax=true
+//
+// 3. JSON-LD Structured Data: Extract from <script type="application/ld+json">
+//    - SEO-friendly structured data
+//    - Limited product details but always present
+//
+// Anti-Bot Bypass:
+// - Uses browser fingerprinting (Playwright)
+// - Residential proxies
+// - Enhanced stealth (navigator.webdriver, plugins, languages)
+// - Resource blocking for speed
+//
+// Performance Optimizations:
+// - Concurrency: 5 parallel requests
+// - Fast timeouts: 60s request, 30s navigation
+// - 3 retries maximum
+// - Session pooling
+//
 import { PlaywrightCrawler, Dataset } from 'crawlee';
 import { Actor, log } from 'apify';
 
@@ -23,7 +51,14 @@ log.info(`Starting Zara scraper for URL: "${startUrl}", results wanted: ${RESULT
 const normalizeImageUrl = (url) => {
     if (!url) return null;
     let cleanUrl = url.startsWith('//') ? `https:${url}` : url;
+    if (cleanUrl.startsWith('/')) cleanUrl = `https://static.zara.net${cleanUrl}`;
     return cleanUrl.split('?')[0];
+};
+
+// Extract category ID from URL
+const extractCategoryId = (url) => {
+    const match = url.match(/[-/]l(\d+)\.html/) || url.match(/category[=/](\d+)/);
+    return match ? match[1] : null;
 };
 
 // Create proxy configuration
@@ -58,7 +93,7 @@ const crawler = new PlaywrightCrawler({
     },
     preNavigationHooks: [
         async ({ page }) => {
-            // Block heavy resources to speed up loading
+            // Block heavy resources for faster loading
             await page.route('**/*', (route) => {
                 const type = route.request().resourceType();
                 const url = route.request().url();
@@ -74,285 +109,176 @@ const crawler = new PlaywrightCrawler({
                 return route.continue();
             });
 
-            // Stealth
+            // Enhanced stealth
             await page.addInitScript(() => {
                 Object.defineProperty(navigator, 'webdriver', { get: () => false });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
             });
         },
     ],
     async requestHandler({ page, request, crawler: crawlerInstance }) {
         log.info(`Processing: ${request.url}`);
 
-        // Wait for page to fully load
+        // Wait for page to load and establish session
         await page.waitForLoadState('domcontentloaded');
-        await page.waitForTimeout(2000); // Give extra time for dynamic content
+        await page.waitForTimeout(2000);
 
-        // Check if page loaded successfully (not blocked)
+        // Check if page loaded successfully
         const pageTitle = await page.title().catch(() => '');
         if (pageTitle.includes('Access Denied') || pageTitle.includes('Blocked') || pageTitle.includes('403')) {
-            log.warning('Page appears to be blocked or access denied');
+            log.warning('Page blocked by anti-bot. Session may be flagged.');
             return;
         }
 
-        // Retry loop - wait for window.zara.dataLayer to be populated
-        let retries = 0;
-        const maxRetries = 10;
+        log.info('Page loaded successfully. Extracting data...');
+
+        // Strategy 1: Extract from window.__PRELOADED_STATE__ or window.zara
+        const preloadedData = await page.evaluate(() => {
+            try {
+                // Priority 1: __PRELOADED_STATE__ (SSR data)
+                if (window.__PRELOADED_STATE__) {
+                    return {
+                        source: '__PRELOADED_STATE__',
+                        data: window.__PRELOADED_STATE__,
+                    };
+                }
+
+                // Priority 2: window.zara object
+                if (window.zara) {
+                    return {
+                        source: 'window.zara',
+                        data: window.zara,
+                    };
+                }
+
+                return { source: null, data: null };
+            } catch (e) {
+                return { source: null, data: null, error: e.message };
+            }
+        });
+
         let extractedProducts = [];
 
-        while (retries < maxRetries && extractedProducts.length === 0) {
-            await page.waitForTimeout(500); // Wait 0.5 second between attempts
-            retries++;
+        // Extract products from preloaded data
+        if (preloadedData.data) {
+            log.info(`Found ${preloadedData.source} data source`);
+            const products = extractProductsFromData(preloadedData.data);
+            if (products && products.length > 0) {
+                extractedProducts = products;
+                log.info(`Extracted ${products.length} products from ${preloadedData.source}`);
+            }
+        }
 
-            // Extract products from Zara's dataLayer
-            const result = await page.evaluate(() => {
+        // Strategy 2: Fetch via internal API (if available)
+        if (extractedProducts.length === 0) {
+            log.info('Attempting to fetch via internal API...');
+            
+            const categoryId = extractCategoryId(request.url);
+            if (categoryId) {
+                const apiProducts = await page.evaluate(async (catId) => {
+                    try {
+                        // Build API URL
+                        const locale = window.location.pathname.split('/').slice(1, 3).join('/');
+                        const apiUrl = `https://www.zara.com/${locale}/category/${catId}/products?ajax=true`;
+                        
+                        // Fetch using browser context (inherits cookies/session)
+                        const response = await fetch(apiUrl, {
+                            headers: {
+                                'accept': 'application/json',
+                                'x-requested-with': 'XMLHttpRequest',
+                            },
+                        });
+
+                        if (!response.ok) {
+                            return { error: `API returned ${response.status}`, products: [] };
+                        }
+
+                        const data = await response.json();
+                        return { products: data.productGroups || data.products || [], data };
+                    } catch (e) {
+                        return { error: e.message, products: [] };
+                    }
+                }, categoryId);
+
+                if (apiProducts.products && apiProducts.products.length > 0) {
+                    extractedProducts = normalizeProducts(apiProducts.products);
+                    log.info(`Fetched ${extractedProducts.length} products via API`);
+                }
+            }
+        }
+
+        // Strategy 3: Parse from JSON-LD structured data
+        if (extractedProducts.length === 0) {
+            log.info('Attempting to extract from JSON-LD...');
+            const jsonLdProducts = await page.evaluate(() => {
                 try {
-                    // Check if zara object exists
-                    if (!window.zara || !window.zara.dataLayer) {
-                        return { error: 'window.zara.dataLayer not found yet', products: [], retry: true };
+                    const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
+                    for (const script of scripts) {
+                        const data = JSON.parse(script.textContent);
+                        if (data['@type'] === 'ItemList' && data.itemListElement) {
+                            return data.itemListElement;
+                        }
                     }
-
-                    // Extract products from dataLayer
-                    let products = null;
-
-                    // Try different possible paths for product data
-                    const dataLayer = window.zara.dataLayer;
-
-                    // Path 1: Most common path - products array
-                    if (dataLayer.products && Array.isArray(dataLayer.products)) {
-                        products = dataLayer.products;
-                    }
-
-                    // Path 2: Check for productList
-                    if ((!products || products.length === 0) && dataLayer.productList && Array.isArray(dataLayer.productList)) {
-                        products = dataLayer.productList;
-                    }
-
-                    // Path 3: Check for category.products
-                    if ((!products || products.length === 0) && dataLayer.category?.products) {
-                        products = dataLayer.category.products;
-                    }
-
-                    // Path 4: Check for page.products
-                    if ((!products || products.length === 0) && dataLayer.page?.products) {
-                        products = dataLayer.page.products;
-                    }
-
-                    // Path 5: Search through all properties for product arrays
-                    if (!products || products.length === 0) {
-                        const searchForProducts = (obj, depth = 0) => {
-                            if (depth > 8 || !obj || typeof obj !== 'object') return null;
-
-                            // Check if this is an array with product-like items
-                            if (Array.isArray(obj) && obj.length > 0) {
-                                const firstItem = obj[0];
-                                if (firstItem && (firstItem.id || firstItem.productId || firstItem.seo || firstItem.name)) {
-                                    return obj;
-                                }
-                            }
-
-                            // Recursively search
-                            for (const key of Object.keys(obj)) {
-                                if (key === 'products' || key === 'productList' || key === 'items') {
-                                    if (Array.isArray(obj[key]) && obj[key].length > 0) {
-                                        return obj[key];
-                                    }
-                                }
-                                const found = searchForProducts(obj[key], depth + 1);
-                                if (found) return found;
-                            }
-                            return null;
-                        };
-
-                        products = searchForProducts(dataLayer);
-                    }
-
-                    if (!products || !Array.isArray(products) || products.length === 0) {
-                        return { error: 'Products not found in dataLayer', products: [], retry: true };
-                    }
-
-                    // Map products to normalized format
-                    return {
-                        products: products.map(item => {
-                            const productId = String(item.id || item.productId || item.seo?.keyword || '');
-                            const name = item.name || item.title || item.seo?.seoProductId || '';
-                            
-                            // Extract price information
-                            let price = null;
-                            let currency = 'GBP';
-                            
-                            if (item.price) {
-                                price = item.price;
-                            } else if (item.displayPrice) {
-                                price = item.displayPrice;
-                            } else if (item.formattedPrice) {
-                                price = item.formattedPrice;
-                            }
-                            
-                            // Extract currency if available
-                            if (item.currency) {
-                                currency = item.currency;
-                            } else if (item.currencyIso) {
-                                currency = item.currencyIso;
-                            }
-
-                            // Extract image URL
-                            let imageUrl = null;
-                            if (item.image) {
-                                imageUrl = item.image;
-                            } else if (item.xmedia && Array.isArray(item.xmedia) && item.xmedia.length > 0) {
-                                const firstImage = item.xmedia[0];
-                                if (firstImage.url) {
-                                    imageUrl = firstImage.url;
-                                } else if (firstImage.path) {
-                                    imageUrl = firstImage.path;
-                                }
-                            } else if (item.images && Array.isArray(item.images) && item.images.length > 0) {
-                                imageUrl = item.images[0];
-                            }
-
-                            // Build product URL
-                            let productUrl = null;
-                            if (item.url) {
-                                productUrl = item.url;
-                            } else if (item.seo?.keyword) {
-                                productUrl = `/${item.seo.keyword}.html`;
-                            } else if (productId) {
-                                productUrl = `/product/${productId}.html`;
-                            }
-
-                            // Get availability
-                            const availability = item.availability || 
-                                               (item.inStock ? 'in_stock' : 'out_of_stock') || 
-                                               null;
-
-                            return {
-                                productId,
-                                name,
-                                price,
-                                currency,
-                                imageUrl,
-                                productUrl,
-                                availability,
-                                category: item.category || null,
-                                subcategory: item.subcategory || null,
-                                colors: item.colors || null,
-                            };
-                        }),
-                        count: products.length,
-                    };
+                    return [];
                 } catch (e) {
-                    return { error: e.message, products: [], retry: true };
+                    return [];
                 }
             });
 
-            if (result.error && result.retry) {
-                log.debug(`Attempt ${retries}/${maxRetries}: ${result.error}`);
-                continue;
-            }
-
-            if (result.products && result.products.length > 0) {
-                extractedProducts = result.products;
-                log.info(`Found ${result.count || extractedProducts.length} products after ${retries} attempts`);
+            if (jsonLdProducts && jsonLdProducts.length > 0) {
+                extractedProducts = normalizeProducts(jsonLdProducts);
+                log.info(`Extracted ${extractedProducts.length} products from JSON-LD`);
             }
         }
 
         if (extractedProducts.length === 0) {
-            log.warning(`No products found after ${maxRetries} attempts`);
+            log.warning('No products found after all extraction attempts');
             return;
         }
 
         // Process and save products
-        const products = [];
+        const productsToSave = [];
         for (const item of extractedProducts) {
-            if (!item.productId || !item.name) continue;
-
-            // Build full image URL
-            let fullImageUrl = item.imageUrl;
-            if (fullImageUrl && !fullImageUrl.startsWith('http')) {
-                if (fullImageUrl.startsWith('//')) {
-                    fullImageUrl = `https:${fullImageUrl}`;
-                } else {
-                    fullImageUrl = `https://static.zara.net${fullImageUrl}`;
-                }
-            }
-
-            // Build full product URL
-            let fullProductUrl = item.productUrl;
-            if (fullProductUrl && !fullProductUrl.startsWith('http')) {
-                const baseUrl = new URL(request.url);
-                fullProductUrl = `${baseUrl.origin}${fullProductUrl}`;
-            }
-
-            products.push({
-                product_id: item.productId,
-                name: item.name,
-                price: item.price,
-                currency: item.currency,
-                image_url: normalizeImageUrl(fullImageUrl),
-                product_url: fullProductUrl,
-                availability: item.availability,
-                category: item.category,
-                subcategory: item.subcategory,
-                colors: item.colors,
-            });
-        }
-
-        log.info(`Extracted ${products.length} valid products`);
-
-        // Save products
-        const newProducts = [];
-        for (const product of products) {
             if (saved >= RESULTS_WANTED) break;
+            if (!item.product_id) continue;
 
-            if (!seenIds.has(product.product_id)) {
-                seenIds.add(product.product_id);
-                newProducts.push(product);
+            if (!seenIds.has(item.product_id)) {
+                seenIds.add(item.product_id);
+                productsToSave.push(item);
                 saved++;
             }
         }
 
-        if (newProducts.length > 0) {
-            await Dataset.pushData(newProducts);
-            log.info(`Saved ${newProducts.length} new products. Total: ${saved}/${RESULTS_WANTED}`);
+        if (productsToSave.length > 0) {
+            await Dataset.pushData(productsToSave);
+            log.info(`Saved ${productsToSave.length} new products. Total: ${saved}/${RESULTS_WANTED}`);
         }
 
-        // Check if we need more products and pagination exists
-        if (saved < RESULTS_WANTED) {
-            log.info('Looking for pagination...');
+        // Pagination: Load more products if needed
+        if (saved < RESULTS_WANTED && extractedProducts.length > 0) {
+            log.info('Checking for more products...');
             
-            // Try to find and click "Load more" or next page button
-            const nextButtonClicked = await page.evaluate(() => {
-                // Look for various "Load more" button selectors
-                const selectors = [
-                    'button[data-qa-action="load-more"]',
-                    'button.load-more',
-                    'button[class*="load-more"]',
-                    'button[class*="show-more"]',
-                    '.pagination .next',
-                    'a.next-page',
-                ];
-
-                for (const selector of selectors) {
-                    const button = document.querySelector(selector);
-                    if (button && !button.disabled) {
-                        button.click();
-                        return true;
-                    }
+            const hasMore = await page.evaluate(async () => {
+                // Try to trigger "load more" or scroll
+                const loadMoreBtn = document.querySelector('[data-qa-action="load-more"], button.load-more, button[class*="show-more"]');
+                if (loadMoreBtn && !loadMoreBtn.disabled) {
+                    loadMoreBtn.click();
+                    return true;
                 }
-                return false;
-            }).catch(() => false);
-
-            if (nextButtonClicked) {
-                log.info('Clicked "Load more" button, waiting for new products...');
-                await page.waitForTimeout(3000);
                 
-                // Re-enqueue the same URL to process newly loaded products
+                // Try scrolling to trigger lazy load
+                window.scrollTo(0, document.body.scrollHeight);
+                return false;
+            });
+
+            if (hasMore) {
+                await page.waitForTimeout(2000);
+                // Re-enqueue to get newly loaded products
                 await crawlerInstance.addRequests([{
                     url: request.url,
                     userData: { attempt: (request.userData?.attempt || 0) + 1 },
                 }]);
-            } else {
-                log.info('No pagination button found or products limit reached');
             }
         }
     },
@@ -361,6 +287,119 @@ const crawler = new PlaywrightCrawler({
         log.error(`Request ${request.url} failed: ${error.message}`);
     },
 });
+
+// Helper: Extract products from various data structures
+function extractProductsFromData(data) {
+    const searchPaths = [
+        'dataLayer.products',
+        'dataLayer.productList',
+        'dataLayer.category.products',
+        'dataLayer.page.products',
+        'products',
+        'productList',
+        'productGroups',
+        'category.products',
+    ];
+
+    for (const path of searchPaths) {
+        const products = getNestedValue(data, path);
+        if (Array.isArray(products) && products.length > 0) {
+            return normalizeProducts(products);
+        }
+    }
+
+    // Deep search
+    const found = deepSearch(data, (obj) => {
+        return Array.isArray(obj) && obj.length > 0 &&
+               obj[0] && (obj[0].id || obj[0].productId || obj[0].seo || obj[0].name);
+    });
+
+    return found ? normalizeProducts(found) : [];
+}
+
+// Helper: Get nested object value
+function getNestedValue(obj, path) {
+    return path.split('.').reduce((acc, part) => acc?.[part], obj);
+}
+
+// Helper: Deep search for product arrays
+function deepSearch(obj, testFn, depth = 0, maxDepth = 10) {
+    if (depth > maxDepth || !obj || typeof obj !== 'object') return null;
+    
+    if (testFn(obj)) return obj;
+    
+    for (const key of Object.keys(obj)) {
+        const result = deepSearch(obj[key], testFn, depth + 1, maxDepth);
+        if (result) return result;
+    }
+    
+    return null;
+}
+
+// Helper: Normalize products to consistent format
+function normalizeProducts(products) {
+    return products.map(item => {
+        // Handle different product structures
+        const product = item.item || item.product || item;
+        
+        const productId = String(
+            product.id || product.productId || product.seo?.keyword ||
+            product.commercialComponents?.[0]?.id || ''
+        );
+        
+        const name = product.name || product.title ||
+                    product.seo?.seoProductId || product.seo?.keyword || '';
+        
+        // Price extraction
+        let price = null;
+        if (product.price) {
+            price = typeof product.price === 'object' ? product.price.value || product.price.amount : product.price;
+        } else if (product.displayPrice) {
+            price = product.displayPrice;
+        } else if (product.formattedPrice) {
+            price = product.formattedPrice;
+        }
+        
+        // Currency
+        const currency = product.currency || product.currencyIso || 'GBP';
+        
+        // Image URL
+        let imageUrl = null;
+        if (product.image) {
+            imageUrl = typeof product.image === 'string' ? product.image : product.image.url;
+        } else if (product.xmedia && Array.isArray(product.xmedia) && product.xmedia.length > 0) {
+            const firstImage = product.xmedia[0];
+            imageUrl = firstImage.url || firstImage.path;
+        } else if (product.images && Array.isArray(product.images) && product.images.length > 0) {
+            imageUrl = product.images[0];
+        }
+        
+        // Product URL
+        let productUrl = product.url || product.detailUrl;
+        if (!productUrl && product.seo?.keyword) {
+            productUrl = `/${product.seo.keyword}.html`;
+        }
+        
+        // Availability
+        const availability = product.availability ||
+                           (product.inStock ? 'in_stock' : 'out_of_stock') ||
+                           null;
+        
+        return {
+            product_id: productId,
+            name: name,
+            price: price,
+            currency: currency,
+            image_url: normalizeImageUrl(imageUrl),
+            product_url: productUrl && !productUrl.startsWith('http') ?
+                        `https://www.zara.com${productUrl}` : productUrl,
+            availability: availability,
+            category: product.category || product.section || null,
+            subcategory: product.subcategory || product.subSection || null,
+            colors: product.colors || product.availableColors || null,
+        };
+    }).filter(p => p.product_id && p.name);
+}
 
 await crawler.run([{ url: startUrl }]);
 log.info(`Scraping completed. Total products saved: ${saved}`);
