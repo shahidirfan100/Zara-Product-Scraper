@@ -163,10 +163,17 @@ const crawler = new PlaywrightCrawler({
         // Extract products from preloaded data
         if (preloadedData.data) {
             log.info(`Found ${preloadedData.source} data source`);
+            
+            // Debug: Log available keys
+            const topLevelKeys = Object.keys(preloadedData.data).slice(0, 10);
+            log.debug(`Top-level keys: ${topLevelKeys.join(', ')}`);
+            
             const products = extractProductsFromData(preloadedData.data);
             if (products && products.length > 0) {
                 extractedProducts = products;
                 log.info(`Extracted ${products.length} products from ${preloadedData.source}`);
+            } else {
+                log.warning(`No valid products found in ${preloadedData.source}`);
             }
         }
 
@@ -291,30 +298,32 @@ const crawler = new PlaywrightCrawler({
 // Helper: Extract products from various data structures
 function extractProductsFromData(data) {
     const searchPaths = [
-        'dataLayer.products',
-        'dataLayer.productList',
-        'dataLayer.category.products',
-        'dataLayer.page.products',
-        'products',
         'productList',
+        'products',
         'productGroups',
         'category.products',
+        'category.productIds',
+        'data.products',
+        'data.productList',
     ];
 
     for (const path of searchPaths) {
         const products = getNestedValue(data, path);
-        if (Array.isArray(products) && products.length > 0) {
+        if (products && isProductArray(products)) {
+            log.info(`Found products at path: ${path}`);
             return normalizeProducts(products);
         }
     }
 
-    // Deep search
-    const found = deepSearch(data, (obj) => {
-        return Array.isArray(obj) && obj.length > 0 &&
-               obj[0] && (obj[0].id || obj[0].productId || obj[0].seo || obj[0].name);
-    });
-
-    return found ? normalizeProducts(found) : [];
+    // Deep search with better validation
+    const found = deepSearch(data, (obj) => isProductArray(obj));
+    
+    if (found) {
+        log.info(`Found products via deep search`);
+        return normalizeProducts(found);
+    }
+    
+    return [];
 }
 
 // Helper: Get nested object value
@@ -336,54 +345,116 @@ function deepSearch(obj, testFn, depth = 0, maxDepth = 10) {
     return null;
 }
 
+// Helper: Validate if array contains actual products (not media formats)
+function isProductArray(arr) {
+    if (!Array.isArray(arr) || arr.length === 0) return false;
+    
+    const firstItem = arr[0];
+    if (!firstItem || typeof firstItem !== 'object') return false;
+    
+    // Check if it's a product (must have product-like properties)
+    const hasProductProps = firstItem.id || firstItem.productId || firstItem.name || 
+                           firstItem.commercialComponents || firstItem.detail;
+    
+    // Exclude media format arrays (these have type names like "PNG", "MPEG4_ZOOM")
+    const isMediaFormat = typeof firstItem === 'string' || 
+                         (firstItem.id && typeof firstItem.id === 'number' && firstItem.id < 100 && !firstItem.name);
+    
+    return hasProductProps && !isMediaFormat;
+}
+
 // Helper: Normalize products to consistent format
 function normalizeProducts(products) {
+    if (!Array.isArray(products)) return [];
+    
     return products.map(item => {
-        // Handle different product structures
-        const product = item.item || item.product || item;
+        // Skip invalid items
+        if (!item || typeof item !== 'object') return null;
         
+        // Handle different product structures
+        const product = item.detail || item.item || item.product || item;
+        
+        // Extract product ID - must be a meaningful string
         const productId = String(
-            product.id || product.productId || product.seo?.keyword ||
+            product.id || product.productId || 
+            product.seo?.keyword || product.seo?.seoProductId ||
             product.commercialComponents?.[0]?.id || ''
         );
         
-        const name = product.name || product.title ||
-                    product.seo?.seoProductId || product.seo?.keyword || '';
+        // Skip if product ID looks like a media format ID (small numbers)
+        if (!productId || (productId.length < 4 && /^\d+$/.test(productId))) {
+            return null;
+        }
         
-        // Price extraction
+        // Extract name - must exist
+        const name = product.name || product.title ||
+                    product.seo?.seoProductId || product.seo?.keyword ||
+                    product.detail?.displayName || '';
+        
+        // Skip if no name
+        if (!name) return null;
+        
+        // Price extraction with multiple fallbacks
         let price = null;
         if (product.price) {
-            price = typeof product.price === 'object' ? product.price.value || product.price.amount : product.price;
+            if (typeof product.price === 'object') {
+                price = product.price.value || product.price.amount || product.price.formattedPrice;
+            } else {
+                price = product.price;
+            }
         } else if (product.displayPrice) {
             price = product.displayPrice;
         } else if (product.formattedPrice) {
             price = product.formattedPrice;
+        } else if (product.detail?.price) {
+            price = product.detail.price;
         }
         
         // Currency
-        const currency = product.currency || product.currencyIso || 'GBP';
+        const currency = product.currency || product.currencyIso || 
+                        product.detail?.currency || 'GBP';
         
-        // Image URL
+        // Image URL with multiple fallbacks
         let imageUrl = null;
         if (product.image) {
             imageUrl = typeof product.image === 'string' ? product.image : product.image.url;
         } else if (product.xmedia && Array.isArray(product.xmedia) && product.xmedia.length > 0) {
-            const firstImage = product.xmedia[0];
-            imageUrl = firstImage.url || firstImage.path;
+            // Find actual image (not video format)
+            const realImage = product.xmedia.find(m => 
+                m.url && !m.mediaType?.includes('VIDEO') && !m.mediaType?.includes('MPEG')
+            );
+            if (realImage) {
+                imageUrl = realImage.url || realImage.path;
+            }
         } else if (product.images && Array.isArray(product.images) && product.images.length > 0) {
             imageUrl = product.images[0];
+        } else if (product.detail?.xmedia?.[0]) {
+            imageUrl = product.detail.xmedia[0].url || product.detail.xmedia[0].path;
         }
         
         // Product URL
-        let productUrl = product.url || product.detailUrl;
+        let productUrl = product.url || product.detailUrl || product.detail?.url;
         if (!productUrl && product.seo?.keyword) {
             productUrl = `/${product.seo.keyword}.html`;
+        } else if (!productUrl && productId) {
+            productUrl = `/product/${productId}.html`;
         }
         
         // Availability
         const availability = product.availability ||
+                           product.detail?.availability ||
                            (product.inStock ? 'in_stock' : 'out_of_stock') ||
                            null;
+        
+        // Category info
+        const category = product.category || product.section || 
+                        product.detail?.category || null;
+        const subcategory = product.subcategory || product.subSection ||
+                           product.detail?.subcategory || null;
+        
+        // Colors
+        const colors = product.colors || product.availableColors ||
+                      product.detail?.colors || null;
         
         return {
             product_id: productId,
@@ -394,11 +465,11 @@ function normalizeProducts(products) {
             product_url: productUrl && !productUrl.startsWith('http') ?
                         `https://www.zara.com${productUrl}` : productUrl,
             availability: availability,
-            category: product.category || product.section || null,
-            subcategory: product.subcategory || product.subSection || null,
-            colors: product.colors || product.availableColors || null,
+            category: category,
+            subcategory: subcategory,
+            colors: colors,
         };
-    }).filter(p => p.product_id && p.name);
+    }).filter(p => p !== null && p.product_id && p.name);
 }
 
 await crawler.run([{ url: startUrl }]);
