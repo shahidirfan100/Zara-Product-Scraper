@@ -123,6 +123,7 @@ const crawler = new PlaywrightCrawler({
                     return {
                         source: '__PRELOADED_STATE__',
                         data: window.__PRELOADED_STATE__,
+                        categoryId: window.__PRELOADED_STATE__.viewPayload?.categoryId
                     };
                 }
 
@@ -131,6 +132,7 @@ const crawler = new PlaywrightCrawler({
                     return {
                         source: 'window.zara',
                         data: window.zara,
+                        categoryId: window.zara.viewPayload?.category?.id || window.zara.viewPayload?.categoryId
                     };
                 }
 
@@ -141,10 +143,11 @@ const crawler = new PlaywrightCrawler({
         });
 
         let extractedProducts = [];
+        let internalCategoryId = preloadedData.categoryId || extractCategoryId(request.url);
 
         // Extract products from preloaded data
         if (preloadedData.data) {
-            log.info(`Found ${preloadedData.source} data source`);
+            log.info(`Found ${preloadedData.source} data source. Category ID: ${internalCategoryId}`);
             const products = extractProductsFromData(preloadedData.data);
             if (products && products.length > 0) {
                 extractedProducts = products;
@@ -153,38 +156,39 @@ const crawler = new PlaywrightCrawler({
         }
 
         // Strategy 2: Fetch via internal API (if available)
-        if (extractedProducts.length === 0) {
-            log.info('Attempting to fetch via internal API...');
+        // Use the internal ID if found, otherwise fallback to URL ID (which might be wrong like 1415 vs 2419833)
+        if (extractedProducts.length === 0 && internalCategoryId) {
+            log.info(`Attempting to fetch via internal API with Category ID: ${internalCategoryId}...`);
 
-            const categoryId = extractCategoryId(request.url);
-            if (categoryId) {
-                const apiProducts = await page.evaluate(async (catId) => {
-                    try {
-                        // Build API URL
-                        const locale = window.location.pathname.split('/').slice(1, 3).join('/');
-                        const apiUrl = `https://www.zara.com/${locale}/category/${catId}/products?ajax=true`;
+            const apiProducts = await page.evaluate(async (catId) => {
+                try {
+                    // Build API URL
+                    const locale = window.location.pathname.split('/').slice(1, 3).join('/');
+                    const apiUrl = `https://www.zara.com/${locale}/category/${catId}/products?ajax=true`;
 
-                        // Fetch using browser context (inherits cookies/session)
-                        const response = await fetch(apiUrl, {
-                            headers: {
-                                'accept': 'application/json',
-                                'x-requested-with': 'XMLHttpRequest',
-                            },
-                        });
+                    // Fetch using browser context (inherits cookies/session)
+                    const response = await fetch(apiUrl, {
+                        headers: {
+                            'accept': 'application/json',
+                            'x-requested-with': 'XMLHttpRequest',
+                        },
+                    });
 
-                        if (!response.ok) {
-                            return { error: `API returned ${response.status}`, products: [] };
-                        }
-
-                        const data = await response.json();
-                        return { products: data.productGroups || data.products || [], data };
-                    } catch (e) {
-                        return { error: e.message, products: [] };
+                    if (!response.ok) {
+                        return { error: `API returned ${response.status}`, products: [] };
                     }
-                }, categoryId);
 
-                if (apiProducts.products && apiProducts.products.length > 0) {
-                    const fromApi = normalizeProducts(apiProducts.products);
+                    const data = await response.json();
+                    return { products: data.productGroups || data.products || [], data };
+                } catch (e) {
+                    return { error: e.message, products: [] };
+                }
+            }, internalCategoryId);
+
+            if (apiProducts.products) {
+                // The API usually returns the same nested structure (productGroups), so we use the smart extractor
+                const fromApi = extractProductsFromData(apiProducts.products.length ? apiProducts.products : apiProducts.data);
+                if (fromApi.length > 0) {
                     log.info(`Fetched ${fromApi.length} products via API`);
                     extractedProducts = fromApi;
                 }
@@ -243,22 +247,19 @@ const crawler = new PlaywrightCrawler({
         if (saved < RESULTS_WANTED && extractedProducts.length > 0) {
             log.info('Checking for more products...');
 
+            // ... (keep existing pagination logic) ...
             const hasMore = await page.evaluate(async () => {
-                // Try to trigger "load more" or scroll
                 const loadMoreBtn = document.querySelector('[data-qa-action="load-more"], button.load-more, button[class*="show-more"]');
                 if (loadMoreBtn && !loadMoreBtn.disabled) {
                     loadMoreBtn.click();
                     return true;
                 }
-
-                // Try scrolling to trigger lazy load
                 window.scrollTo(0, document.body.scrollHeight);
                 return false;
             });
 
             if (hasMore) {
                 await page.waitForTimeout(2000);
-                // Re-enqueue to get newly loaded products
                 await crawlerInstance.addRequests([{
                     url: request.url,
                     userData: { attempt: (request.userData?.attempt || 0) + 1 },
@@ -274,30 +275,47 @@ const crawler = new PlaywrightCrawler({
 
 // Helper: Extract products from various data structures
 function extractProductsFromData(data) {
+    if (!data) return [];
+
+    // Direct array check
+    if (Array.isArray(data)) {
+        // structural check: is this a list of PRODUCTS or GROUPS?
+        // If items identify as products, return them.
+        if (isProductArray(data)) return normalizeProducts(data);
+
+        // If items are groups (have elements/commercialComponents), flatten them
+        const flattened = [];
+        for (const item of data) {
+            if (item.elements) {
+                flattened.push(...extractProductsFromData(item.elements));
+            } else if (item.commercialComponents) {
+                flattened.push(...extractProductsFromData(item.commercialComponents));
+            } else {
+                // Maybe it's a mixed array? Check individually
+                const p = normalizeProducts([item]);
+                if (p.length) flattened.push(...p);
+            }
+        }
+        return flattened;
+    }
+
+    // Object: Search known paths
     const searchPaths = [
+        'productGroups', // Check groups first as they contain the real data
+        'viewPayload.productGroups',
+        'grid.products',
         'productList',
         'products',
-        'productGroups',
         'category.products',
-        'category.productIds',
-        'data.products',
-        'data.productList',
     ];
 
     for (const path of searchPaths) {
-        const products = getNestedValue(data, path);
-        if (products && isProductArray(products)) {
-            log.info(`Found products at path: ${path}`);
-            return normalizeProducts(products);
+        const value = getNestedValue(data, path);
+        if (value) {
+            log.debug(`Found data at ${path}`);
+            const extracted = extractProductsFromData(value);
+            if (extracted.length > 0) return extracted;
         }
-    }
-
-    // Deep search with better validation
-    const found = deepSearch(data, (obj) => isProductArray(obj));
-
-    if (found) {
-        log.info(`Found products via deep search`);
-        return normalizeProducts(found);
     }
 
     return [];
@@ -308,20 +326,6 @@ function getNestedValue(obj, path) {
     return path.split('.').reduce((acc, part) => acc?.[part], obj);
 }
 
-// Helper: Deep search for product arrays
-function deepSearch(obj, testFn, depth = 0, maxDepth = 10) {
-    if (depth > maxDepth || !obj || typeof obj !== 'object') return null;
-
-    if (testFn(obj)) return obj;
-
-    for (const key of Object.keys(obj)) {
-        const result = deepSearch(obj[key], testFn, depth + 1, maxDepth);
-        if (result) return result;
-    }
-
-    return null;
-}
-
 // Helper: Validate if array contains actual products (not media formats)
 function isProductArray(arr) {
     if (!Array.isArray(arr) || arr.length === 0) return false;
@@ -329,9 +333,11 @@ function isProductArray(arr) {
     const firstItem = arr[0];
     if (!firstItem || typeof firstItem !== 'object') return false;
 
+    // Strong indicator it's NOT a product: has nested elements/components
+    if (firstItem.elements || firstItem.commercialComponents) return false;
+
     // Check if it's a product (must have product-like properties)
-    const hasProductProps = firstItem.id || firstItem.productId || firstItem.name ||
-        firstItem.commercialComponents || firstItem.detail;
+    const hasProductProps = firstItem.id || firstItem.productId || firstItem.name || firstItem.detail;
 
     // Exclude media format arrays (these have type names like "PNG", "MPEG4_ZOOM")
     const isMediaFormat = typeof firstItem === 'string' ||
@@ -359,7 +365,8 @@ function normalizeProducts(products) {
         );
 
         // Skip if product ID looks like a media format ID (small numbers)
-        if (!productId || (productId.length < 4 && /^\d+$/.test(productId))) {
+        // Also skip if it identifies as a Category or Group (often has ID but no price/image context here)
+        if (!productId || (productId.length < 4 && /^\d+$/.test(productId)) || productId.length > 20) {
             return null;
         }
 
@@ -387,6 +394,16 @@ function normalizeProducts(products) {
             price = product.detail.price;
         }
 
+        // Correct price (sometimes in cents)
+        if (typeof price === 'number' && price > 1000 && Number.isInteger(price)) {
+            price = price / 100;
+        }
+        // String price clean up
+        if (typeof price === 'string') {
+            const match = price.match(/[\d.,]+/);
+            if (match) price = parseFloat(match[0].replace(/,/g, ''));
+        }
+
         // Currency
         const currency = product.currency || product.currencyIso ||
             product.detail?.currency || 'GBP';
@@ -407,6 +424,14 @@ function normalizeProducts(products) {
             imageUrl = product.images[0];
         } else if (product.detail?.xmedia?.[0]) {
             imageUrl = product.detail.xmedia[0].url || product.detail.xmedia[0].path;
+        }
+
+        // Fallback for color media
+        if (!imageUrl && product.colors && product.colors.length > 0) {
+            const c = product.colors[0];
+            if (c.xmedia && c.xmedia.length > 0) {
+                imageUrl = c.xmedia[0].url || c.xmedia[0].path;
+            }
         }
 
         // Product URL
