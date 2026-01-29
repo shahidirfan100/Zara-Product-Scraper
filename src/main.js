@@ -51,7 +51,7 @@ const crawler = new PlaywrightCrawler({
     maxConcurrency: 5,
     requestHandlerTimeoutSecs: 60,
     navigationTimeoutSecs: 30,
-    
+
     launchContext: {
         launcher: firefox,
         userAgent: getRandomUserAgent(),
@@ -103,13 +103,13 @@ const crawler = new PlaywrightCrawler({
         const categoryData = await page.evaluate(() => {
             const zData = window.zara;
             if (!zData) return null;
-            
+
             // Try different paths for category ID
             const payload = zData.viewPayload || {};
-            const catId = payload.category?.id || 
-                         payload.productFilters?.categoryId ||
-                         zData.appConfig?.categoryId;
-                         
+            const catId = payload.category?.id ||
+                payload.productFilters?.categoryId ||
+                zData.appConfig?.categoryId;
+
             return {
                 categoryId: catId,
                 cookies: document.cookie,
@@ -125,9 +125,9 @@ const crawler = new PlaywrightCrawler({
             const windowProducts = await page.evaluate(() => {
                 const payload = window.zara?.viewPayload;
                 // Check multiple potential locations
-                const products = payload?.products || 
-                               payload?.grid?.products ||
-                               payload?.productGroups?.[0]?.elements?.[0]?.commercialComponents;
+                const products = payload?.products ||
+                    payload?.grid?.products ||
+                    payload?.productGroups?.[0]?.elements?.[0]?.commercialComponents;
                 return products;
             });
 
@@ -140,7 +140,7 @@ const crawler = new PlaywrightCrawler({
         // Step 3: API Fetch (Primary Strategy if initial state empty)
         if (extractedProducts.length === 0 && categoryData?.categoryId) {
             log.info(`Fetching via API for Category ${categoryData.categoryId}...`);
-            
+
             const apiProducts = await page.evaluate(async ({ categoryId, locale }) => {
                 try {
                     const apiUrl = `https://www.zara.com/${locale}/category/${categoryId}/products?ajax=true`;
@@ -154,7 +154,7 @@ const crawler = new PlaywrightCrawler({
                     if (!response.ok) return { error: response.status };
 
                     const data = await response.json();
-                    
+
                     // Parse new API structure
                     // root -> productGroups[] -> elements[] -> commercialComponents[]
                     let products = [];
@@ -169,7 +169,7 @@ const crawler = new PlaywrightCrawler({
                             }
                         });
                     }
-                    
+
                     if (products.length === 0 && data.products) {
                         products = data.products;
                     }
@@ -246,6 +246,8 @@ await Actor.exit();
 
 // --- HELPERS ---
 
+// --- HELPERS ---
+
 function normalizeProducts(rawProducts) {
     if (!Array.isArray(rawProducts)) return [];
 
@@ -254,36 +256,65 @@ function normalizeProducts(rawProducts) {
             // Handle different nesting (commercialComponents often have 'detail' or are direct)
             const p = item.detail || item.item || item;
 
-            // ID
-            const id = String(p.id || p.productId || p.reference || '').replace(/-I\d+$/, '');
-            if (!id || id.length < 4) return null;
+            // ID: Handle numeric IDs (e.g., 495669917)
+            let id = p.id || p.productId || p.reference || '';
+            // If it's a number, convert to string
+            id = String(id).replace(/-I\d+$/, '');
+
+            // Allow IDs that are at least 3 chars (some valid IDs might be short, but usually >4)
+            if (!id || id.length < 3) return null;
 
             // Name
             const name = p.name || p.displayName || p.title || '';
             if (!name) return null;
 
-            // Price
+            // Price: The API returns price in cents/minor units (e.g. 3599 -> 35.99)
+            // We need to detect this. If price is > 1000 and seems integer, it's likely cents.
+            // Or we check `price` vs `displayPrice`.
             let price = null;
             if (p.price) {
-                price = typeof p.price === 'object' ? (p.price.value || p.price.amount) : p.price;
+                const rawPrice = typeof p.price === 'object' ? (p.price.value || p.price.amount) : p.price;
+                // Zara API v2 usually returns integers for cents (e.g. 3599 for 35.99)
+                // If it's an integer and no decimal, divide by 100
+                if (typeof rawPrice === 'number' && Number.isInteger(rawPrice)) {
+                    price = rawPrice / 100;
+                } else {
+                    price = rawPrice;
+                }
             } else if (p.displayPrice) {
-                price = p.displayPrice; // "£ 29.99"
+                // displayPrice might be "£ 35.99"
+                const match = String(p.displayPrice).match(/[\d.,]+/);
+                if (match) {
+                    price = parseFloat(match[0].replace(/,/g, ''));
+                }
             }
 
             // Image
             let imageUrl = null;
-            if (p.xmedia && p.xmedia[0]) {
-                imageUrl = p.xmedia[0].url || p.xmedia[0].path;
-            } else if (p.colors && p.colors[0] && p.colors[0].xmedia && p.colors[0].xmedia[0]) {
-                imageUrl = p.colors[0].xmedia[0].url || p.colors[0].xmedia[0].path;
-            } else if (typeof p.image === 'string') {
-                imageUrl = p.image;
+            // Check for color-specific media first as it's often the main one
+            if (p.colors && p.colors[0]) {
+                const media = p.colors[0].pdpMedia || p.colors[0].xmedia?.[0];
+                if (media) imageUrl = media.url || media.path;
+            }
+
+            if (!imageUrl) {
+                if (p.xmedia && p.xmedia[0]) {
+                    imageUrl = p.xmedia[0].url || p.xmedia[0].path;
+                } else if (typeof p.image === 'string') {
+                    imageUrl = p.image;
+                }
             }
 
             // URL
-            let productUrl = p.seo?.keyword ? `/${p.seo.keyword}.html` : null;
-            if (!productUrl && p.semanticUrl) productUrl = `/${p.semanticUrl}`;
-            
+            let productUrl = null;
+            if (p.seo?.keyword) {
+                productUrl = `/${p.seo.keyword}.html`;
+            } else if (p.semanticUrl) {
+                productUrl = `/${p.semanticUrl}`;
+            } else if (p.seo?.seoProductId) {
+                productUrl = `/product/${p.seo.seoProductId}.html`;
+            }
+
             return {
                 product_id: id,
                 name: name,
