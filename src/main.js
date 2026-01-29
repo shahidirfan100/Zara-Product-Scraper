@@ -254,7 +254,8 @@ function normalizeProducts(rawProducts) {
     return rawProducts.map(item => {
         try {
             // Handle different nesting (commercialComponents often have 'detail' or are direct)
-            const p = item.detail || item.item || item;
+            // Fix: Prioritize root item if it has ID/Name (Zara API v2 structure)
+            const p = (item.id && (item.name || item.displayName)) ? item : (item.detail || item.item || item);
 
             // ID: Handle numeric IDs (e.g., 495669917)
             let id = p.id || p.productId || p.reference || '';
