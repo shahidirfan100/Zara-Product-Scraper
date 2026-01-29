@@ -1,6 +1,6 @@
 // Zara Product Scraper - Production-ready with Playwright Firefox
-import { PlaywrightCrawler, Dataset } from 'crawlee';
 import { Actor, log } from 'apify';
+import { PlaywrightCrawler, Dataset } from 'crawlee';
 import { firefox } from 'playwright';
 
 await Actor.init();
@@ -21,7 +21,6 @@ const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW) ? Math.max(1, +RESUL
 log.info(`Starting Zara scraper for URL: "${startUrl}", results wanted: ${RESULTS_WANTED}`);
 
 // CONFIGURATION
-// Rotated User-Agents for Firefox (Windows, Mac, Linux)
 const USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 14.7; rv:134.0) Gecko/20100101 Firefox/134.0',
@@ -37,20 +36,6 @@ const normalizeImageUrl = (url) => {
     return cleanUrl.split('?')[0];
 };
 
-// Extract category ID from URL
-const extractCategoryId = (url) => {
-    // Matches:
-    // - /...-l1234.html (Standard category)
-    // - /category/1234/...
-    // - /collection/1234/...
-    // - ?categoryId=1234
-    const match = url.match(/[-/]l(\d+)\.html/) ||
-        url.match(/\/category\/(\d+)/) ||
-        url.match(/\/collection\/(\d+)/) ||
-        url.match(/[?&]categoryId=(\d+)/);
-    return match ? match[1] : null;
-};
-
 // Create proxy configuration
 const proxyConfiguration = await Actor.createProxyConfiguration(proxyConfig || {
     useApifyProxy: true,
@@ -62,24 +47,23 @@ const seenIds = new Set();
 
 const crawler = new PlaywrightCrawler({
     proxyConfiguration,
-    maxRequestRetries: 3,
-    useSessionPool: true,
-    sessionPoolOptions: {
-        maxPoolSize: 5,
-        sessionOptions: { maxUsageCount: 3 },
-    },
+    maxRequestRetries: 2,
     maxConcurrency: 5,
     requestHandlerTimeoutSecs: 60,
     navigationTimeoutSecs: 30,
 
-    // STRICT PLAYWRIGHT FIREFOX CONFIGURATION
     launchContext: {
         launcher: firefox,
         userAgent: getRandomUserAgent(),
         launchOptions: {
             headless: true,
-            // ignoreHTTPSErrors: true  <-- Removed as per skill default
-            // firefoxUserPrefs: { ... } <-- Removed custom prefs as per skill default
+            ignoreHTTPSErrors: true,
+            firefoxUserPrefs: {
+                'geo.enabled': false,
+                'media.peerconnection.enabled': false, // Disable WebRTC
+                'webgl.disabled': false,
+                'canvas.captureStream.enabled': false,
+            }
         },
     },
 
@@ -100,140 +84,154 @@ const crawler = new PlaywrightCrawler({
                 }
                 return route.continue();
             });
-            // Manual stealth scripts REMOVED to avoid modifying navigator on Firefox which can leak.
-            // Playwright's firefox launcher manages this better natively.
         },
     ],
-    async requestHandler({ page, request, crawler: crawlerInstance }) {
+
+    requestHandler: async ({ page, request, crawler: crawlerInstance }) => {
         log.info(`Processing: ${request.url}`);
 
-        // Wait for page to load and establish session
-        await page.waitForLoadState('domcontentloaded');
+        // Wait for page to load
         try {
-            await page.waitForTimeout(2000);
-        } catch (e) { }
-
-        // Check if page loaded successfully
-        const pageTitle = await page.title().catch(() => '');
-        if (pageTitle.includes('Access Denied') || pageTitle.includes('Blocked') || pageTitle.includes('403')) {
-            log.warning('Page blocked by anti-bot. Session may be flagged.');
-            // throw new Error('Blocked') // Optional: throw to retry with new IP
-            return;
+            await page.waitForLoadState('domcontentloaded');
+        } catch (e) {
+            log.warning(`Navigation timeout or error: ${e.message}`);
         }
 
-        log.info('Page loaded successfully. Extracting data...');
+        // Check for blocks
+        const pageTitle = await page.title().catch(() => '');
+        if (pageTitle.includes('Access Denied') || pageTitle.includes('Blocked') || pageTitle.includes('403')) {
+            throw new Error(`Page blocked by anti-bot (Title: ${pageTitle}) - retrying with new session`);
+        }
 
-        // Strategy 1: Extract from window.__PRELOADED_STATE__ or window.zara
-        const preloadedData = await page.evaluate(() => {
-            try {
-                // Priority 1: __PRELOADED_STATE__ (SSR data)
-                if (window.__PRELOADED_STATE__) {
-                    return {
-                        source: '__PRELOADED_STATE__',
-                        data: window.__PRELOADED_STATE__,
-                        categoryId: window.__PRELOADED_STATE__.viewPayload?.categoryId
-                    };
-                }
+        log.info('Page loaded successfully. Attempting data extraction...');
 
-                // Priority 2: window.zara object
-                if (window.zara) {
-                    return {
-                        source: 'window.zara',
-                        data: window.zara,
-                        categoryId: window.zara.viewPayload?.category?.id || window.zara.viewPayload?.categoryId
-                    };
-                }
+        // Step 1: Extract Category details from global state
+        const categoryData = await page.evaluate(() => {
+            const zData = window.zara;
+            if (!zData) return null;
 
-                return { source: null, data: null };
-            } catch (e) {
-                return { source: null, data: null, error: e.message };
-            }
+            // Try different paths for category ID
+            const payload = zData.viewPayload || {};
+            const catId = payload.category?.id ||
+                payload.productFilters?.categoryId ||
+                zData.appConfig?.categoryId;
+
+            return {
+                categoryId: catId,
+                cookies: document.cookie,
+                locale: window.location.pathname.split('/').slice(1, 3).join('/')
+            };
         });
 
         let extractedProducts = [];
-        let internalCategoryId = preloadedData.categoryId || extractCategoryId(request.url);
+        // Derive locale fallback from request URL if categoryData failed
+        const requestLocale = new URL(request.url).pathname.split('/').slice(1, 3).join('/');
+        const currentLocale = categoryData?.locale || requestLocale || 'uk/en';
 
-        // Extract products from preloaded data
-        if (preloadedData.data) {
-            log.info(`Found ${preloadedData.source} data source. Category ID: ${internalCategoryId}`);
-            const products = extractProductsFromData(preloadedData.data);
-            if (products && products.length > 0) {
-                extractedProducts = products;
-                log.info(`Extracted ${products.length} products from ${preloadedData.source}`);
+        // Step 2: Extract from initial window.zara payload if available
+        if (categoryData) {
+            log.info(`Identified Category ID: ${categoryData.categoryId}`);
+            const windowProducts = await page.evaluate(() => {
+                const payload = window.zara?.viewPayload;
+                // Check multiple potential locations
+                const products = payload?.products ||
+                    payload?.grid?.products ||
+                    payload?.productGroups?.[0]?.elements?.[0]?.commercialComponents;
+                return products;
+            });
+
+            if (windowProducts && Array.isArray(windowProducts) && windowProducts.length > 0) {
+                log.info(`Found ${windowProducts.length} products in initial state`);
+                const normalized = normalizeProducts(windowProducts, currentLocale);
+                extractedProducts.push(...normalized);
             }
         }
 
-        // Strategy 2: Fetch via internal API (if available)
-        // Use the internal ID if found, otherwise fallback to URL ID (which might be wrong like 1415 vs 2419833)
-        if (extractedProducts.length === 0 && internalCategoryId) {
-            log.info(`Attempting to fetch via internal API with Category ID: ${internalCategoryId}...`);
+        // Step 3: API Fetch (Primary Strategy)
+        // FORCE API fetch if we haven't reached the target count, to ensure we get a full list
+        if (categoryData?.categoryId && extractedProducts.length < RESULTS_WANTED) {
+            log.info(`Fetching via API for Category ${categoryData.categoryId} to ensure complete data...`);
 
-            const apiProducts = await page.evaluate(async (catId) => {
+            const apiProducts = await page.evaluate(async ({ categoryId, locale }) => {
                 try {
-                    // Build API URL
-                    const locale = window.location.pathname.split('/').slice(1, 3).join('/');
-                    const apiUrl = `https://www.zara.com/${locale}/category/${catId}/products?ajax=true`;
-
-                    // Fetch using browser context (inherits cookies/session)
+                    const apiUrl = `https://www.zara.com/${locale}/category/${categoryId}/products?ajax=true`;
                     const response = await fetch(apiUrl, {
                         headers: {
                             'accept': 'application/json',
                             'x-requested-with': 'XMLHttpRequest',
-                        },
+                        }
                     });
 
-                    if (!response.ok) {
-                        return { error: `API returned ${response.status}`, products: [] };
-                    }
+                    if (!response.ok) return { error: response.status };
 
                     const data = await response.json();
-                    return { products: data.productGroups || data.products || [], data };
-                } catch (e) {
-                    return { error: e.message, products: [] };
-                }
-            }, internalCategoryId);
 
-            if (apiProducts.products) {
-                // The API usually returns the same nested structure (productGroups), so we use the smart extractor
-                const fromApi = extractProductsFromData(apiProducts.products.length ? apiProducts.products : apiProducts.data);
-                if (fromApi.length > 0) {
-                    log.info(`Fetched ${fromApi.length} products via API`);
-                    extractedProducts = fromApi;
+                    // Parse new API structure
+                    // root -> productGroups[] -> elements[] -> commercialComponents[]
+                    let products = [];
+                    if (data.productGroups) {
+                        data.productGroups.forEach(group => {
+                            if (group.elements) {
+                                group.elements.forEach(el => {
+                                    if (el.commercialComponents) {
+                                        products.push(...el.commercialComponents);
+                                    }
+                                });
+                            }
+                        });
+                    }
+
+                    if (products.length === 0 && data.products) {
+                        products = data.products;
+                    }
+
+                    return { products };
+                } catch (e) {
+                    return { error: e.message };
                 }
+            }, categoryData);
+
+            if (apiProducts.products && apiProducts.products.length > 0) {
+                log.info(`Fetched ${apiProducts.products.length} products via API`);
+                const normalizedApi = normalizeProducts(apiProducts.products, currentLocale);
+
+                // Merge with initial products (avoiding duplicates)
+                const productMap = new Map();
+                // Add initial products
+                extractedProducts.forEach(p => productMap.set(p.product_id, p));
+                // Add API products (overwriting initial if same ID, as API usually has more detail)
+                normalizedApi.forEach(p => productMap.set(p.product_id, p));
+
+                extractedProducts = Array.from(productMap.values());
+            } else if (apiProducts.error) {
+                log.warning(`API Fetch failed: ${apiProducts.error}`);
             }
         }
 
-        // Strategy 3: Parse from JSON-LD structured data
+        // Step 4: JSON-LD Fallback
         if (extractedProducts.length === 0) {
-            log.info('Attempting to extract from JSON-LD...');
-            const jsonLdProducts = await page.evaluate(() => {
-                try {
-                    const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
-                    for (const script of scripts) {
-                        const data = JSON.parse(script.textContent);
-                        if (data['@type'] === 'ItemList' && data.itemListElement) {
-                            return data.itemListElement;
-                        }
-                    }
-                    return [];
-                } catch (e) {
-                    return [];
-                }
+            log.info('Checking JSON-LD data...');
+            const jsonLdData = await page.evaluate(() => {
+                const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
+                return scripts.map(s => JSON.parse(s.innerText));
             });
 
-            if (jsonLdProducts && jsonLdProducts.length > 0) {
-                const fromLd = normalizeProducts(jsonLdProducts);
-                extractedProducts = fromLd;
-                log.info(`Extracted ${fromLd.length} products from JSON-LD`);
+            for (const data of jsonLdData) {
+                if (data['@type'] === 'ItemList' && Array.isArray(data.itemListElement)) {
+                    const normalizedLd = normalizeProducts(data.itemListElement, currentLocale);
+                    log.info(`Found ${normalizedLd.length} products in JSON-LD`);
+                    extractedProducts.push(...normalizedLd);
+                    break;
+                }
             }
         }
 
         if (extractedProducts.length === 0) {
-            log.warning('No products found after all extraction attempts');
+            log.warning('No products found. Possible blocking or changed layout.');
             return;
         }
 
-        // Process and save products
+        // Save unique products
         const productsToSave = [];
         for (const item of extractedProducts) {
             if (saved >= RESULTS_WANTED) break;
@@ -250,203 +248,110 @@ const crawler = new PlaywrightCrawler({
             await Dataset.pushData(productsToSave);
             log.info(`Saved ${productsToSave.length} new products. Total: ${saved}/${RESULTS_WANTED}`);
         }
-
-        // Pagination: Load more products if needed
-        if (saved < RESULTS_WANTED && extractedProducts.length > 0) {
-            log.info('Checking for more products...');
-
-            // ... (keep existing pagination logic) ...
-            const hasMore = await page.evaluate(async () => {
-                const loadMoreBtn = document.querySelector('[data-qa-action="load-more"], button.load-more, button[class*="show-more"]');
-                if (loadMoreBtn && !loadMoreBtn.disabled) {
-                    loadMoreBtn.click();
-                    return true;
-                }
-                window.scrollTo(0, document.body.scrollHeight);
-                return false;
-            });
-
-            if (hasMore) {
-                await page.waitForTimeout(2000);
-                await crawlerInstance.addRequests([{
-                    url: request.url,
-                    userData: { attempt: (request.userData?.attempt || 0) + 1 },
-                }]);
-            }
-        }
     },
 
-    failedRequestHandler({ request }, error) {
+    failedRequestHandler: async ({ request }, error) => {
         log.error(`Request ${request.url} failed: ${error.message}`);
     },
 });
 
-// Helper: Extract products from various data structures
-function extractProductsFromData(data) {
-    if (!data) return [];
-    let results = [];
-
-    // 1. If it's an array, try to normalize it as a product list
-    if (Array.isArray(data)) {
-        // Try extracting direct products from this array
-        const directProducts = normalizeProducts(data);
-        if (directProducts.length > 0) {
-            results.push(...directProducts);
-        }
-
-        // 2. ALSO recursively check each item for nested groups/components
-        // (Even if we found products, some might be "Bundles" with child elements)
-        for (const item of data) {
-            if (item && typeof item === 'object') {
-                if (item.elements && Array.isArray(item.elements)) {
-                    results.push(...extractProductsFromData(item.elements));
-                }
-                if (item.commercialComponents && Array.isArray(item.commercialComponents)) {
-                    results.push(...extractProductsFromData(item.commercialComponents));
-                }
-            }
-        }
-        return results;
-    }
-
-    // 3. If it's an object, search known paths
-    if (typeof data === 'object') {
-        const searchPaths = [
-            'productGroups',
-            'viewPayload.productGroups',
-            'grid.products',
-            'productList',
-            'products',
-            'category.products',
-        ];
-
-        for (const path of searchPaths) {
-            const value = getNestedValue(data, path);
-            if (value && Array.isArray(value)) {
-                const extracted = extractProductsFromData(value);
-                if (extracted.length > 0) results.push(...extracted);
-            }
-        }
-
-        if (results.length > 0) return results;
-    }
-
-    return results;
-}
-
-// Helper: Get nested object value
-function getNestedValue(obj, path) {
-    return path.split('.').reduce((acc, part) => acc?.[part], obj);
-}
-
-// Helper: Normalize products to consistent format
-function normalizeProducts(products) {
-    if (!Array.isArray(products)) return [];
-
-    return products.map(item => {
-        if (!item || typeof item !== 'object') return null;
-
-        // Handle different product structures
-        const product = item.detail || item.item || item.product || item;
-
-        // Extract product ID
-        const productId = String(
-            product.id || product.productId ||
-            product.seo?.keyword || product.seo?.seoProductId ||
-            product.commercialComponents?.[0]?.id || ''
-        );
-
-        // Filter out bad IDs
-        if (!productId || (productId.length < 4 && /^\d+$/.test(productId)) || productId.length > 20) {
-            return null;
-        }
-
-        // Extract name
-        const name = product.name || product.title ||
-            product.seo?.seoProductId || product.seo?.keyword ||
-            product.detail?.displayName || '';
-
-        if (!name || typeof name !== 'string' || name.trim() === '') return null;
-
-        // Filter marketing banners
-        const isMarketing = product.type === 'Bundle' && product.isBannerWithoutLink;
-        if (isMarketing) return null;
-
-        // Price extraction
-        let price = null;
-        if (product.price) {
-            if (typeof product.price === 'object') {
-                price = product.price.value || product.price.amount || product.price.formattedPrice;
-            } else {
-                price = product.price;
-            }
-        } else if (product.displayPrice) {
-            price = product.displayPrice;
-        } else if (product.formattedPrice) {
-            price = product.formattedPrice;
-        } else if (product.detail?.price) {
-            price = product.detail.price;
-        }
-
-        if (typeof price === 'number' && price > 1000 && Number.isInteger(price)) price = price / 100;
-        if (typeof price === 'string') {
-            const match = price.match(/[\d.,]+/);
-            if (match) price = parseFloat(match[0].replace(/,/g, ''));
-        }
-
-        // Currency
-        const currency = product.currency || product.currencyIso || product.detail?.currency || 'GBP';
-
-        // Image URL
-        let imageUrl = null;
-        if (product.image) {
-            imageUrl = typeof product.image === 'string' ? product.image : product.image.url;
-        } else if (product.xmedia && Array.isArray(product.xmedia) && product.xmedia.length > 0) {
-            const realImage = product.xmedia.find(m =>
-                m.url && !m.mediaType?.includes('VIDEO') && !m.mediaType?.includes('MPEG')
-            );
-            if (realImage) imageUrl = realImage.url || realImage.path;
-        } else if (product.images && Array.isArray(product.images) && product.images.length > 0) {
-            imageUrl = product.images[0];
-        } else if (product.detail?.xmedia?.[0]) {
-            imageUrl = product.detail.xmedia[0].url || product.detail.xmedia[0].path;
-        }
-
-        if (!imageUrl && product.colors && product.colors.length > 0) {
-            const c = product.colors[0];
-            if (c.xmedia && c.xmedia.length > 0) imageUrl = c.xmedia[0].url || c.xmedia[0].path;
-        }
-
-        // Product URL
-        let productUrl = product.url || product.detailUrl || product.detail?.url;
-        if (!productUrl && product.seo?.keyword) productUrl = `/${product.seo.keyword}.html`;
-        else if (!productUrl && productId) productUrl = `/product/${productId}.html`;
-
-        // Availability
-        const availability = product.availability || product.detail?.availability ||
-            (product.inStock ? 'in_stock' : 'out_of_stock') || null;
-
-        // Category/Colors
-        const category = product.category || product.section || product.detail?.category || null;
-        const subcategory = product.subcategory || product.subSection || product.detail?.subcategory || null;
-        const colors = product.colors || product.availableColors || product.detail?.colors || null;
-
-        return {
-            product_id: productId,
-            name: name,
-            price: price,
-            currency: currency,
-            image_url: normalizeImageUrl(imageUrl),
-            product_url: productUrl && !productUrl.startsWith('http') ?
-                `https://www.zara.com${productUrl}` : productUrl,
-            availability: availability,
-            category: category,
-            subcategory: subcategory,
-            colors: colors,
-        };
-    }).filter(p => p !== null && p.product_id && p.name);
-}
-
 await crawler.run([{ url: startUrl }]);
 log.info(`Scraping completed. Total products saved: ${saved}`);
 await Actor.exit();
+
+// --- HELPERS ---
+
+function normalizeProducts(rawProducts, locale = 'uk/en') {
+    if (!Array.isArray(rawProducts)) return [];
+
+    return rawProducts.map(item => {
+        try {
+            // Fix: Prioritize root item if it has ID/Name (Zara API v2 structure)
+            const p = (item.id && (item.name || item.displayName)) ? item : (item.detail || item.item || item);
+
+            // ID: Handle numeric IDs (e.g., 495669917)
+            let id = p.id || p.productId || p.reference || '';
+            id = String(id).replace(/-I\d+$/, '');
+
+            // Allow IDs that are at least 3 chars
+            if (!id || id.length < 3) return null;
+
+            // Name
+            const name = p.name || p.displayName || p.title || '';
+            if (!name) return null;
+
+            // Price: The API returns price in cents/minor units (e.g. 3599 -> 35.99)
+            let price = null;
+            if (p.price) {
+                const rawPrice = typeof p.price === 'object' ? (p.price.value || p.price.amount) : p.price;
+                if (typeof rawPrice === 'number' && Number.isInteger(rawPrice) && rawPrice > 100) {
+                    price = rawPrice / 100;
+                } else {
+                    price = rawPrice;
+                }
+            } else if (p.displayPrice) {
+                const match = String(p.displayPrice).match(/[\d.,]+/);
+                if (match) {
+                    price = parseFloat(match[0].replace(/,/g, ''));
+                }
+            }
+
+            // Image
+            let imageUrl = null;
+            // Check for color-specific media first as it's often the main one
+            if (p.colors && p.colors[0]) {
+                const media = p.colors[0].pdpMedia || p.colors[0].xmedia?.[0]; // Added xmedia fallback inside color
+                if (media) imageUrl = media.url || media.path;
+            }
+
+            if (!imageUrl) {
+                if (p.xmedia && p.xmedia[0]) {
+                    imageUrl = p.xmedia[0].url || p.xmedia[0].path;
+                } else if (typeof p.image === 'string') {
+                    imageUrl = p.image;
+                } else if (p.image && p.image.url) { // Handle object structure
+                    imageUrl = p.image.url;
+                }
+            }
+
+            // Hard check for deeply nested image in detail object
+            if (!imageUrl && p.detail?.colors?.[0]?.xmedia?.[0]) {
+                imageUrl = p.detail.colors[0].xmedia[0].url || p.detail.colors[0].xmedia[0].path;
+            }
+
+            // URL Construction
+            let productUrl = null;
+
+            // Prefer seo values
+            const slug = p.seo?.keyword || p.keyword || name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+            const seoId = p.seo?.seoProductId || p.seoProductId || id;
+
+            // Construct full URL with -p suffix which is standard for Zara
+            if (slug && seoId) {
+                // Use locale prefix if available
+                const prefix = locale ? `/${locale}` : '';
+                productUrl = `${prefix}/${slug}-p${seoId}.html`;
+            } else if (p.semanticUrl) {
+                productUrl = `/${p.semanticUrl}`;
+            }
+
+            // Ensure absolute URL
+            if (productUrl && !productUrl.startsWith('http')) {
+                productUrl = `https://www.zara.com${productUrl}`;
+            }
+
+            return {
+                product_id: id,
+                name: name,
+                price: price,
+                currency: p.currency || 'GBP',
+                image_url: normalizeImageUrl(imageUrl),
+                product_url: productUrl,
+                reference: p.reference,
+                availability: p.availability || (p.inStock ? 'in_stock' : 'out_of_stock')
+            };
+        } catch (e) {
+            return null;
+        }
+    }).filter(x => x !== null);
+}
