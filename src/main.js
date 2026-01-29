@@ -58,6 +58,12 @@ const crawler = new PlaywrightCrawler({
         launchOptions: {
             headless: true,
             ignoreHTTPSErrors: true,
+            firefoxUserPrefs: {
+                'geo.enabled': false,
+                'media.peerconnection.enabled': false, // Disable WebRTC
+                'webgl.disabled': false,
+                'canvas.captureStream.enabled': false,
+            }
         },
     },
 
@@ -133,13 +139,15 @@ const crawler = new PlaywrightCrawler({
 
             if (windowProducts && Array.isArray(windowProducts) && windowProducts.length > 0) {
                 log.info(`Found ${windowProducts.length} products in initial state`);
-                extractedProducts = normalizeProducts(windowProducts);
+                const normalized = normalizeProducts(windowProducts);
+                extractedProducts.push(...normalized);
             }
         }
 
-        // Step 3: API Fetch (Primary Strategy if initial state empty)
-        if (extractedProducts.length === 0 && categoryData?.categoryId) {
-            log.info(`Fetching via API for Category ${categoryData.categoryId}...`);
+        // Step 3: API Fetch (Primary Strategy)
+        // FORCE API fetch if we haven't reached the target count, to ensure we get a full list
+        if (categoryData?.categoryId && extractedProducts.length < RESULTS_WANTED) {
+            log.info(`Fetching via API for Category ${categoryData.categoryId} to ensure complete data...`);
 
             const apiProducts = await page.evaluate(async ({ categoryId, locale }) => {
                 try {
@@ -182,7 +190,16 @@ const crawler = new PlaywrightCrawler({
 
             if (apiProducts.products && apiProducts.products.length > 0) {
                 log.info(`Fetched ${apiProducts.products.length} products via API`);
-                extractedProducts = normalizeProducts(apiProducts.products);
+                const normalizedApi = normalizeProducts(apiProducts.products);
+
+                // Merge with initial products (avoiding duplicates)
+                const productMap = new Map();
+                // Add initial products
+                extractedProducts.forEach(p => productMap.set(p.product_id, p));
+                // Add API products (overwriting initial if same ID, as API usually has more detail)
+                normalizedApi.forEach(p => productMap.set(p.product_id, p));
+
+                extractedProducts = Array.from(productMap.values());
             } else if (apiProducts.error) {
                 log.warning(`API Fetch failed: ${apiProducts.error}`);
             }
@@ -198,8 +215,9 @@ const crawler = new PlaywrightCrawler({
 
             for (const data of jsonLdData) {
                 if (data['@type'] === 'ItemList' && Array.isArray(data.itemListElement)) {
-                    extractedProducts = normalizeProducts(data.itemListElement);
-                    log.info(`Found ${extractedProducts.length} products in JSON-LD`);
+                    const normalizedLd = normalizeProducts(data.itemListElement);
+                    log.info(`Found ${normalizedLd.length} products in JSON-LD`);
+                    extractedProducts.push(...normalizedLd);
                     break;
                 }
             }
@@ -227,12 +245,6 @@ const crawler = new PlaywrightCrawler({
             await Dataset.pushData(productsToSave);
             log.info(`Saved ${productsToSave.length} new products. Total: ${saved}/${RESULTS_WANTED}`);
         }
-
-        // Pagination if needed (via API only for speed)
-        // Note: For simplicity in this specialized fix, we trust the API returned all items 
-        // or we handle pagination by adding a 'page' parameter if supported, 
-        // but Zara's 'ajax=true' usually returns the full category or we need to scroll.
-        // For now, let's rely on the main batch.
     },
 
     failedRequestHandler: async ({ request }, error) => {
@@ -246,23 +258,19 @@ await Actor.exit();
 
 // --- HELPERS ---
 
-// --- HELPERS ---
-
 function normalizeProducts(rawProducts) {
     if (!Array.isArray(rawProducts)) return [];
 
     return rawProducts.map(item => {
         try {
-            // Handle different nesting (commercialComponents often have 'detail' or are direct)
             // Fix: Prioritize root item if it has ID/Name (Zara API v2 structure)
             const p = (item.id && (item.name || item.displayName)) ? item : (item.detail || item.item || item);
 
             // ID: Handle numeric IDs (e.g., 495669917)
             let id = p.id || p.productId || p.reference || '';
-            // If it's a number, convert to string
             id = String(id).replace(/-I\d+$/, '');
 
-            // Allow IDs that are at least 3 chars (some valid IDs might be short, but usually >4)
+            // Allow IDs that are at least 3 chars
             if (!id || id.length < 3) return null;
 
             // Name
@@ -270,20 +278,15 @@ function normalizeProducts(rawProducts) {
             if (!name) return null;
 
             // Price: The API returns price in cents/minor units (e.g. 3599 -> 35.99)
-            // We need to detect this. If price is > 1000 and seems integer, it's likely cents.
-            // Or we check `price` vs `displayPrice`.
             let price = null;
             if (p.price) {
                 const rawPrice = typeof p.price === 'object' ? (p.price.value || p.price.amount) : p.price;
-                // Zara API v2 usually returns integers for cents (e.g. 3599 for 35.99)
-                // If it's an integer and no decimal, divide by 100
-                if (typeof rawPrice === 'number' && Number.isInteger(rawPrice)) {
+                if (typeof rawPrice === 'number' && Number.isInteger(rawPrice) && rawPrice > 100) {
                     price = rawPrice / 100;
                 } else {
                     price = rawPrice;
                 }
             } else if (p.displayPrice) {
-                // displayPrice might be "£ 35.99"
                 const match = String(p.displayPrice).match(/[\d.,]+/);
                 if (match) {
                     price = parseFloat(match[0].replace(/,/g, ''));
@@ -294,7 +297,7 @@ function normalizeProducts(rawProducts) {
             let imageUrl = null;
             // Check for color-specific media first as it's often the main one
             if (p.colors && p.colors[0]) {
-                const media = p.colors[0].pdpMedia || p.colors[0].xmedia?.[0];
+                const media = p.colors[0].pdpMedia || p.colors[0].xmedia?.[0]; // Added xmedia fallback inside color
                 if (media) imageUrl = media.url || media.path;
             }
 
@@ -303,7 +306,14 @@ function normalizeProducts(rawProducts) {
                     imageUrl = p.xmedia[0].url || p.xmedia[0].path;
                 } else if (typeof p.image === 'string') {
                     imageUrl = p.image;
+                } else if (p.image && p.image.url) { // Handle object structure
+                    imageUrl = p.image.url;
                 }
+            }
+
+            // Hard check for deeply nested image in detail object
+            if (!imageUrl && p.detail?.colors?.[0]?.xmedia?.[0]) {
+                imageUrl = p.detail.colors[0].xmedia[0].url || p.detail.colors[0].xmedia[0].path;
             }
 
             // URL
