@@ -39,7 +39,15 @@ const normalizeImageUrl = (url) => {
 
 // Extract category ID from URL
 const extractCategoryId = (url) => {
-    const match = url.match(/[-/]l(\d+)\.html/) || url.match(/category[=/](\d+)/);
+    // Matches:
+    // - /...-l1234.html (Standard category)
+    // - /category/1234/...
+    // - /collection/1234/...
+    // - ?categoryId=1234
+    const match = url.match(/[-/]l(\d+)\.html/) ||
+        url.match(/\/category\/(\d+)/) ||
+        url.match(/\/collection\/(\d+)/) ||
+        url.match(/[?&]categoryId=(\d+)/);
     return match ? match[1] : null;
 };
 
