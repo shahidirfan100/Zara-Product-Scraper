@@ -284,49 +284,54 @@ const crawler = new PlaywrightCrawler({
 // Helper: Extract products from various data structures
 function extractProductsFromData(data) {
     if (!data) return [];
+    let results = [];
 
-    // Direct array check
+    // 1. If it's an array, try to normalize it as a product list
     if (Array.isArray(data)) {
-        // structural check: is this a list of PRODUCTS or GROUPS?
-        // If items identify as products, return them.
-        if (isProductArray(data)) return normalizeProducts(data);
+        // Try extracting direct products from this array
+        const directProducts = normalizeProducts(data);
+        if (directProducts.length > 0) {
+            results.push(...directProducts);
+        }
 
-        // If items are groups (have elements/commercialComponents), flatten them
-        const flattened = [];
+        // 2. ALSO recursively check each item for nested groups/components
+        // (Even if we found products, some might be "Bundles" with child elements)
         for (const item of data) {
-            if (item.elements) {
-                flattened.push(...extractProductsFromData(item.elements));
-            } else if (item.commercialComponents) {
-                flattened.push(...extractProductsFromData(item.commercialComponents));
-            } else {
-                // Maybe it's a mixed array? Check individually
-                const p = normalizeProducts([item]);
-                if (p.length) flattened.push(...p);
+            if (item && typeof item === 'object') {
+                if (item.elements && Array.isArray(item.elements)) {
+                    results.push(...extractProductsFromData(item.elements));
+                }
+                if (item.commercialComponents && Array.isArray(item.commercialComponents)) {
+                    results.push(...extractProductsFromData(item.commercialComponents));
+                }
             }
         }
-        return flattened;
+        return results;
     }
 
-    // Object: Search known paths
-    const searchPaths = [
-        'productGroups', // Check groups first as they contain the real data
-        'viewPayload.productGroups',
-        'grid.products',
-        'productList',
-        'products',
-        'category.products',
-    ];
+    // 3. If it's an object, search known paths
+    if (typeof data === 'object') {
+        const searchPaths = [
+            'productGroups',
+            'viewPayload.productGroups',
+            'grid.products',
+            'productList',
+            'products',
+            'category.products',
+        ];
 
-    for (const path of searchPaths) {
-        const value = getNestedValue(data, path);
-        if (value) {
-            log.debug(`Found data at ${path}`);
-            const extracted = extractProductsFromData(value);
-            if (extracted.length > 0) return extracted;
+        for (const path of searchPaths) {
+            const value = getNestedValue(data, path);
+            if (value && Array.isArray(value)) {
+                const extracted = extractProductsFromData(value);
+                if (extracted.length > 0) results.push(...extracted);
+            }
         }
+
+        if (results.length > 0) return results;
     }
 
-    return [];
+    return results;
 }
 
 // Helper: Get nested object value
@@ -334,59 +339,40 @@ function getNestedValue(obj, path) {
     return path.split('.').reduce((acc, part) => acc?.[part], obj);
 }
 
-// Helper: Validate if array contains actual products (not media formats)
-function isProductArray(arr) {
-    if (!Array.isArray(arr) || arr.length === 0) return false;
-
-    const firstItem = arr[0];
-    if (!firstItem || typeof firstItem !== 'object') return false;
-
-    // Strong indicator it's NOT a product: has nested elements/components
-    if (firstItem.elements || firstItem.commercialComponents) return false;
-
-    // Check if it's a product (must have product-like properties)
-    const hasProductProps = firstItem.id || firstItem.productId || firstItem.name || firstItem.detail;
-
-    // Exclude media format arrays (these have type names like "PNG", "MPEG4_ZOOM")
-    const isMediaFormat = typeof firstItem === 'string' ||
-        (firstItem.id && typeof firstItem.id === 'number' && firstItem.id < 100 && !firstItem.name);
-
-    return hasProductProps && !isMediaFormat;
-}
-
 // Helper: Normalize products to consistent format
 function normalizeProducts(products) {
     if (!Array.isArray(products)) return [];
 
     return products.map(item => {
-        // Skip invalid items
         if (!item || typeof item !== 'object') return null;
 
         // Handle different product structures
         const product = item.detail || item.item || item.product || item;
 
-        // Extract product ID - must be a meaningful string
+        // Extract product ID
         const productId = String(
             product.id || product.productId ||
             product.seo?.keyword || product.seo?.seoProductId ||
             product.commercialComponents?.[0]?.id || ''
         );
 
-        // Skip if product ID looks like a media format ID (small numbers)
-        // Also skip if it identifies as a Category or Group (often has ID but no price/image context here)
+        // Filter out bad IDs
         if (!productId || (productId.length < 4 && /^\d+$/.test(productId)) || productId.length > 20) {
             return null;
         }
 
-        // Extract name - must exist
+        // Extract name
         const name = product.name || product.title ||
             product.seo?.seoProductId || product.seo?.keyword ||
             product.detail?.displayName || '';
 
-        // Skip if no name
-        if (!name) return null;
+        if (!name || typeof name !== 'string' || name.trim() === '') return null;
 
-        // Price extraction with multiple fallbacks
+        // Filter marketing banners
+        const isMarketing = product.type === 'Bundle' && product.isBannerWithoutLink;
+        if (isMarketing) return null;
+
+        // Price extraction
         let price = null;
         if (product.price) {
             if (typeof product.price === 'object') {
@@ -402,69 +388,48 @@ function normalizeProducts(products) {
             price = product.detail.price;
         }
 
-        // Correct price (sometimes in cents)
-        if (typeof price === 'number' && price > 1000 && Number.isInteger(price)) {
-            price = price / 100;
-        }
-        // String price clean up
+        if (typeof price === 'number' && price > 1000 && Number.isInteger(price)) price = price / 100;
         if (typeof price === 'string') {
             const match = price.match(/[\d.,]+/);
             if (match) price = parseFloat(match[0].replace(/,/g, ''));
         }
 
         // Currency
-        const currency = product.currency || product.currencyIso ||
-            product.detail?.currency || 'GBP';
+        const currency = product.currency || product.currencyIso || product.detail?.currency || 'GBP';
 
-        // Image URL with multiple fallbacks
+        // Image URL
         let imageUrl = null;
         if (product.image) {
             imageUrl = typeof product.image === 'string' ? product.image : product.image.url;
         } else if (product.xmedia && Array.isArray(product.xmedia) && product.xmedia.length > 0) {
-            // Find actual image (not video format)
             const realImage = product.xmedia.find(m =>
                 m.url && !m.mediaType?.includes('VIDEO') && !m.mediaType?.includes('MPEG')
             );
-            if (realImage) {
-                imageUrl = realImage.url || realImage.path;
-            }
+            if (realImage) imageUrl = realImage.url || realImage.path;
         } else if (product.images && Array.isArray(product.images) && product.images.length > 0) {
             imageUrl = product.images[0];
         } else if (product.detail?.xmedia?.[0]) {
             imageUrl = product.detail.xmedia[0].url || product.detail.xmedia[0].path;
         }
 
-        // Fallback for color media
         if (!imageUrl && product.colors && product.colors.length > 0) {
             const c = product.colors[0];
-            if (c.xmedia && c.xmedia.length > 0) {
-                imageUrl = c.xmedia[0].url || c.xmedia[0].path;
-            }
+            if (c.xmedia && c.xmedia.length > 0) imageUrl = c.xmedia[0].url || c.xmedia[0].path;
         }
 
         // Product URL
         let productUrl = product.url || product.detailUrl || product.detail?.url;
-        if (!productUrl && product.seo?.keyword) {
-            productUrl = `/${product.seo.keyword}.html`;
-        } else if (!productUrl && productId) {
-            productUrl = `/product/${productId}.html`;
-        }
+        if (!productUrl && product.seo?.keyword) productUrl = `/${product.seo.keyword}.html`;
+        else if (!productUrl && productId) productUrl = `/product/${productId}.html`;
 
         // Availability
-        const availability = product.availability ||
-            product.detail?.availability ||
-            (product.inStock ? 'in_stock' : 'out_of_stock') ||
-            null;
+        const availability = product.availability || product.detail?.availability ||
+            (product.inStock ? 'in_stock' : 'out_of_stock') || null;
 
-        // Category info
-        const category = product.category || product.section ||
-            product.detail?.category || null;
-        const subcategory = product.subcategory || product.subSection ||
-            product.detail?.subcategory || null;
-
-        // Colors
-        const colors = product.colors || product.availableColors ||
-            product.detail?.colors || null;
+        // Category/Colors
+        const category = product.category || product.section || product.detail?.category || null;
+        const subcategory = product.subcategory || product.subSection || product.detail?.subcategory || null;
+        const colors = product.colors || product.availableColors || product.detail?.colors || null;
 
         return {
             product_id: productId,
