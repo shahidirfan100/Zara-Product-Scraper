@@ -1,8 +1,8 @@
 {
     "name": "zara-product-scraper",
     "version": "1.0.0",
-    "description": "Fast and reliable Zara product scraper.",
     "type": "module",
+    "description": "Scrapes product data from Zara.com using Playwright Firefox.",
     "dependencies": {
         "apify": "^3.5.2",
         "crawlee": "^3.15.3",
@@ -10,12 +10,8 @@
     },
     "scripts": {
         "start": "node src/main.js",
-        "format": "prettier --write .",
-        "format:check": "prettier --check .",
-        "lint": "eslint",
-        "lint:fix": "eslint --fix",
-        "test": "echo \"Error: oops, the Actor has no tests yet, sad!\" && exit 1"
+        "postinstall": "npx playwright install firefox"
     },
-    "author": "Shahid Irfan",
+    "author": "Apify",
     "license": "ISC"
 }
