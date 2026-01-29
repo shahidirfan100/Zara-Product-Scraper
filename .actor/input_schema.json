@@ -7,9 +7,10 @@
         "startUrl": {
             "title": "Start URL",
             "type": "string",
-            "description": "Zara category URL to scrape products from.",
+            "description": "Zara category URL to scrape products from. Format: https://www.zara.com/{country}/{language}/{category}-l{categoryId}.html",
             "editor": "textfield",
-            "prefill": "https://www.zara.com/uk/en/woman-new-in-l1056.html"
+            "prefill": "https://www.zara.com/us/en/woman-beauty-perfumes-l1415.html",
+            "example": "https://www.zara.com/uk/en/woman-new-in-l1056.html"
         },
         "results_wanted": {
             "title": "Results Wanted",

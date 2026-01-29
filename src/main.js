@@ -48,9 +48,9 @@ const seenIds = new Set();
 const crawler = new PlaywrightCrawler({
     proxyConfiguration,
     maxRequestRetries: 2,
-    maxConcurrency: 5,
-    requestHandlerTimeoutSecs: 60,
-    navigationTimeoutSecs: 30,
+    maxConcurrency: 1, // Lower for stealth
+    requestHandlerTimeoutSecs: 45,
+    navigationTimeoutSecs: 20,
 
     launchContext: {
         launcher: firefox,
@@ -58,25 +58,27 @@ const crawler = new PlaywrightCrawler({
         launchOptions: {
             headless: true,
             ignoreHTTPSErrors: true,
+            args: ['--no-sandbox', '--disable-setuid-sandbox'],
             firefoxUserPrefs: {
                 'geo.enabled': false,
-                'media.peerconnection.enabled': false, // Disable WebRTC
+                'media.peerconnection.enabled': false,
                 'webgl.disabled': false,
-                'canvas.captureStream.enabled': false,
             }
         },
     },
 
     preNavigationHooks: [
         async ({ page }) => {
-            // Block heavy resources for faster loading
+            // Aggressive resource blocking for speed
             await page.route('**/*', (route) => {
                 const type = route.request().resourceType();
                 const url = route.request().url();
 
-                if (['font', 'media', 'stylesheet'].includes(type) ||
-                    url.includes('google-analytics') ||
-                    url.includes('googletagmanager') ||
+                // Block all non-essential resources
+                if (['font', 'media', 'stylesheet', 'image'].includes(type) ||
+                    url.includes('analytics') ||
+                    url.includes('tracking') ||
+                    url.includes('gtm') ||
                     url.includes('facebook') ||
                     url.includes('doubleclick') ||
                     url.includes('hotjar')) {
@@ -90,14 +92,7 @@ const crawler = new PlaywrightCrawler({
     requestHandler: async ({ page, request, crawler: crawlerInstance }) => {
         log.info(`Processing: ${request.url}`);
 
-        // Wait for page to load
-        try {
-            await page.waitForLoadState('domcontentloaded');
-        } catch (e) {
-            log.warning(`Navigation timeout or error: ${e.message}`);
-        }
-
-        // Check for blocks
+        // Quick block check
         const pageTitle = await page.title().catch(() => '');
         if (pageTitle.includes('Access Denied') || pageTitle.includes('Blocked') || pageTitle.includes('403')) {
             throw new Error(`Page blocked by anti-bot (Title: ${pageTitle}) - retrying with new session`);
